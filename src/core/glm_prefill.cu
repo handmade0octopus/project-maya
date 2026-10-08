@@ -20,6 +20,7 @@
 
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/glm_batch.hpp"
+#include "strata/kernels/glm_fast.hpp"   // spec1's verify head: head_prep + the output MvJob (the token path's)
 #include "strata/kernels/iq_kernels.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/prefill/gemm.hpp"
@@ -1000,13 +1001,38 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
                 float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
                 float* cst = state_ + kda_conv_[(size_t) il];
-                gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
-                gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
                 sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
                 sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
                 S->mark("kda_proj", s);
-                gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
-                            state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                if (spec1_snap_on_) {
+                    // spec1 verify (fast_verify2): the recurrence runs token by token (the same arithmetic as
+                    // the T-token call - the fast decode path runs it this way), snapshotting each recurrent
+                    // layer's state (S + conv are contiguous) after the FIRST position so a rejected second
+                    // position can roll back to it
+                    for (int t = 0; t < tn; ++t) {
+                        if (t == 1)
+                            cudaMemcpyAsync(spec1_snap_ + (size_t) spec1_snap_idx_ * spec1_run_,
+                                            state_ + kda_S_[(size_t) il], (size_t) spec1_run_ * sizeof(float),
+                                            cudaMemcpyDeviceToDevice, s);
+                        const float* prt[3] = {B.proj[0] + (size_t) t * DI, B.proj[1] + (size_t) t * DI,
+                                               B.proj[2] + (size_t) t * DI};
+                        float* cvt[3] = {B.conv[0] + (size_t) t * DI, B.conv[1] + (size_t) t * DI,
+                                         B.conv[2] + (size_t) t * DI};
+                        gb::kda_conv(prt, Ly.conv, cst, cvt, 1, DI, g.d_conv, s);
+                        gb::kda_conv_state(prt, cst, 1, DI, g.d_conv, s);
+                        gb::kda_rec(cvt[0], cvt[1], cvt[2], B.g1 + (size_t) t * DI, Ly.dt_bias, Ly.ssm_a, g.kda_lb,
+                                    B.beta + (size_t) t * g.n_head, state_ + kda_S_[(size_t) il],
+                                    B.g2 + (size_t) t * DI, Ly.ssm_norm, g.norm_eps, g.n_head, 1,
+                                    B.out16 + (size_t) t * DI, s);
+                    }
+                    ++spec1_snap_idx_;
+                } else {
+                    gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
+                    gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
+                    gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
+                                state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16,
+                                s);
+                }
                 S->mark("kda_rec", s);
                 hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
             } else {
@@ -1755,6 +1781,114 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                      (long long) n, ms, ms / (double) n, 1000.0 * (double) n / ms, (unsigned long long) sr,
                      (unsigned long long) sd, 100.0 * (double) rr / (double) std::max<uint64_t>(1, rr + rs), plan);
     }
+    return true;
+}
+
+// --------------------------------------------------------------------- spec1: the batched verify pair
+// ONE trunk pass over two positions through the prefill machinery (the weights stream once for both): toks[0] at
+// p0 is the confirmed pending token, toks[1] at p0+1 the NextN block's draft.  Leaves per-position logits in
+// spec1_logits_ and final hidden states in spec1_h_, the recurrent states snapshotted after the first position
+// (spec1_snap_, taken inside prefill_half), and pos_ = p0 + 2.  A rejected draft rolls back with spec1_rollback.
+bool Glm5Model::fast_verify2(int64_t p0, const int32_t* toks, std::string& err) {
+    FastState* F = fast_;
+    PrefillState* S = pf_;
+    const Glm5Geometry& g = g_;
+    const int E = g.n_embd;
+    cudaSetDevice(dev_);
+    namespace gf = strata::kernels::glmf;
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
+        err = "glm spec1: no embedding dequantizer";
+        return false;
+    }
+    prefill_carve(2);
+    const auto tv0 = std::chrono::steady_clock::now();
+    prefill_lend();
+    const auto tv1 = std::chrono::steady_clock::now();   // STRATA_GLM_SPEC1_PROF: lend / half / head phase times
+    const auto bail = [&]() {
+        prefill_return();
+        cudaSetDevice(dev_);
+    };
+    // the two embedding rows -> x and the residual streams (the prefill path's embed step)
+    cudaStreamSynchronize(F->cs);
+    const size_t row_b = strata::kernels::iq_row_bytes(pack_emb_type_, E);
+    for (int t = 0; t < 2; ++t)
+        tt->to_float(pack_emb_src_ + (size_t) toks[t] * row_b, S->emb_h + (size_t) t * E, E);
+    cudaMemcpyAsync(S->x, S->emb_h, (size_t) 2 * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    gb::embed_rows(S->x, S->R, 2, E, F->cs);
+    spec1_snap_idx_ = 0;
+    spec1_snap_on_ = true;
+    const uint64_t sram0 = S->staged_ram, srow0 = S->rows_staged;
+    const bool okh = prefill_half(p0, 2, err, nullptr);
+    spec1_snap_on_ = false;
+    const auto tv2 = std::chrono::steady_clock::now();
+    if (!okh) {
+        bail();
+        return false;
+    }
+    // the head for both positions: stream mean -> output_norm -> the output row -> that position's logits
+    const auto& ow = ws_map_.at("output.weight");
+    const float* onorm = w_.at("output_norm.weight");
+    for (int t = 0; t < 2; ++t) {
+        gf::head_prep(S->R + (size_t) t * 4 * E, onorm, g.norm_eps, E, F->head_x, F->head_xq, F->cs);
+        cudaMemcpyAsync(spec1_h_ + (size_t) t * E, F->head_x, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice,
+                        F->cs);
+        gf::MvJob o = {ow.q, F->head_xq, F->head_x, spec1_logits_ + (size_t) t * g.n_vocab, nullptr, 1.0f, ow.type,
+                       E, g.n_vocab};
+        if (ow.type == 0) o.w = ow.f32;
+        if (!gf::mv(&o, 1, F->cs)) {
+            err = "glm spec1: the head (type " + std::to_string(ow.type) + ")";
+            bail();
+            return false;
+        }
+    }
+    cudaStreamSynchronize(F->cs);
+    const auto tv3 = std::chrono::steady_clock::now();
+    const cudaError_t e = cudaGetLastError();
+    bail();
+    static const bool s1prof = getenv("STRATA_GLM_SPEC1_PROF") != nullptr;
+    if (s1prof) {
+        static uint64_t n_v = 0;
+        static double ms_lend = 0, ms_half = 0, ms_head = 0;
+        static uint64_t st_ram = 0, st_rows = 0;
+        static std::map<std::string, double> pacc0;
+        const auto dms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        ms_lend += dms(tv0, tv1);
+        ms_half += dms(tv1, tv2);
+        ms_head += dms(tv2, tv3);
+        st_ram += S->staged_ram - sram0;
+        st_rows += S->rows_staged - srow0;
+        if (++n_v % 32 == 0) {
+            std::fprintf(stderr, "glm spec1 prof: %llu verifies | lend %.2f ms | half %.2f ms | head %.2f ms | "
+                                 "staged/verify %llu experts (%llu rows)\n",
+                         (unsigned long long) n_v, ms_lend / (double) n_v, ms_half / (double) n_v,
+                         ms_head / (double) n_v, (unsigned long long) (st_ram / n_v),
+                         (unsigned long long) (st_rows / n_v));
+            if (S->prof) {   // the phase marks' deltas since the last print (device stream time per phase)
+                std::vector<std::pair<double, std::string>> v;
+                double tot = 0;
+                for (auto& kv : S->pacc) {
+                    const double d = kv.second - pacc0[kv.first];
+                    if (d <= 0) continue;
+                    v.push_back({d, kv.first});
+                    tot += d;
+                }
+                std::sort(v.rbegin(), v.rend());
+                std::fprintf(stderr, "  phases over %d verifies (ms of stream time):\n", 32);
+                for (auto& e : v)
+                    std::fprintf(stderr, "    %-14s %8.1f ms  %5.1f%%\n", e.second.c_str(), e.first,
+                                 100.0 * e.first / std::max(1e-9, tot));
+                for (auto& kv : S->pacc) pacc0[kv.first] = kv.second;
+            }
+        }
+    }
+    if (e != cudaSuccess) {
+        err = std::string("glm spec1: ") + cudaGetErrorString(e);
+        return false;
+    }
+    pos_ = p0 + 2;
     return true;
 }
 

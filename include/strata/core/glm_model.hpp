@@ -383,6 +383,23 @@ public:
     bool spec_kda_copy(bool restore);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
+    // ---- the single-GPU speculative decode ("spec1", STRATA_GLM_SPEC1=1 + STRATA_GLM_MTP=1): each round runs the
+    // NextN block's draft, then ONE batched trunk pass over [confirmed, draft] through the prefill machinery
+    // (weights read once for both positions), samples the confirmed position's logits, keeps the speculative
+    // position only when its input equals the trunk's own token - every emitted token comes from the trunk's true
+    // logits, so the output is exactly the token-at-a-time loop's for any sampler.  A miss rolls the recurrent
+    // states back to the per-token snapshot the pass took.  src/core/glm_fast_path.cu / glm_prefill.cu.
+    bool spec1_ready() const;
+    bool decode_spec1(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                      int64_t& produced, std::string& err);
+    bool fast_verify2(int64_t p0, const int32_t* toks, std::string& err);   // the batched pair pass (glm_prefill.cu)
+    float* spec1_snap_ = nullptr;        // KDA recurrent-state snapshot after the pass's first position (contiguous run)
+    float* spec1_logits_ = nullptr;      // [2][n_vocab] the pass's per-position logits (device)
+    float* spec1_h_ = nullptr;           // [2][n_embd] the pass's per-position final hidden states (device)
+    int spec1_run_ = 0;                  // one recurrent layer's state floats (S + conv, contiguous)
+    int spec1_nrec_ = 0;                 // recurrent layers snapshotted
+    bool spec1_snap_on_ = false;         // prefill_half takes the per-token snapshots while a verify runs
+    int spec1_snap_idx_ = 0;             // the recurrent layer the next snapshot goes to (reset per pass)
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;

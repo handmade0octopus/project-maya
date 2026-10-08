@@ -2993,6 +2993,141 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     return ok;
 }
 
+// ---------------------------------------------------------------- single-GPU speculative decode
+// "spec1" (STRATA_GLM_SPEC1=1, with STRATA_GLM_MTP=1 so the NextN block is loaded and tiered): one round =
+//   * the pending token t (sampled, emitted - the position pos_ is its own) and the NextN block's draft d for
+//     the token after it (predicted from the last confirmed position's hidden state);
+//   * ONE batched trunk pass over [t @ pos_, d @ pos_+1] through the prefill machinery (fast_verify2): the
+//     dense weights and attention stream once for both positions, per-position logits and final hidden states,
+//     and per-layer snapshots of the recurrent states after the first position;
+//   * t2 = sample from position pos_'s logits (the TRUE next token), emitted;
+//   * hit (t2 == d): both positions stand (the second one's input equals the trunk's own token); the next
+//     pending comes from the pass's second logits row.  miss: roll the recurrent states back to the snapshots
+//     (pos_ = the first position again) and run the ordinary fast_token(t2) - the pass's first position stands
+//     either way, so a round ALWAYS emits two tokens;
+//   * the catch-up fast_mtp(pos_-1, t2) advances the draft block's caches with confirmed tokens only and
+//     yields the next round's draft.
+// Every emitted token is sampled from the trunk's true logits at its own position (the draft only decides
+// whether the precomputed second position is REUSED), so the output distribution is exactly the plain loop's
+// for any sampler.  The batched/streamed numerics agree as everywhere between the prompt and decode paths.
+bool Glm5Model::spec1_ready() const {
+    return fast_ != nullptr && split_next_ == nullptr && pf_ != nullptr && mtp_il_ >= 0 &&
+           getenv("STRATA_GLM_SPEC1") != nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr;
+}
+
+bool Glm5Model::decode_spec1(strata::kernels::SamplerParams& sp, int64_t max_new,
+                             const std::function<bool(int)>& emit, int64_t& produced, std::string& err) {
+    produced = 0;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaSetDevice(dev_);
+    if (spec1_logits_ == nullptr) {
+        int n_rec = 0;
+        for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il);
+        spec1_run_ = (int) (g.d_inner() * g.kda_head_dim + 3 * (int64_t) g.d_inner() * (g.d_conv - 1));
+        spec1_nrec_ = n_rec;
+        if (cudaMalloc(&spec1_logits_, (size_t) 2 * g.n_vocab * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&spec1_h_, (size_t) 2 * g.n_embd * sizeof(float)) != cudaSuccess ||
+            (n_rec > 0 &&
+             cudaMalloc(&spec1_snap_, (size_t) n_rec * spec1_run_ * sizeof(float)) != cudaSuccess)) {
+            cudaGetLastError();
+            err = "glm spec1: the verify buffers did not allocate";
+            return false;
+        }
+    }
+    // sample one token from a device logits row, exactly as sample_token does (greedy: the device argmax)
+    const auto sample_from = [&](const float* dev_logits) -> int {
+        if (sp.greedy) {
+            gf::argmax(dev_logits, (int) g.n_vocab, F->tok, F->cs);
+            cudaMemcpyAsync(F->tok_h, F->tok, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+            cudaStreamSynchronize(F->cs);
+            return F->tok_h[0];
+        }
+        strata::kernels::sample_tokens(dev_logits, 1, (int) g.n_vocab, nullptr, 0, sp, d_tok_, nullptr);
+        int tok = -1;
+        if (cudaMemcpy(&tok, d_tok_, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+        return tok;
+    };
+    // the recurrent states back to the verify's snapshots (after its first position); the DSA caches are
+    // append-only - the position alone truncates them (the same rule as snapshot_restore)
+    const auto rollback = [&]() {
+        int i = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            if (!g.is_recr(il)) continue;
+            cudaMemcpyAsync(state_ + kda_S_[(size_t) il], spec1_snap_ + (size_t) i * spec1_run_,
+                            (size_t) spec1_run_ * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+            ++i;
+        }
+        cudaStreamSynchronize(F->cs);
+    };
+    // the first pending token (the prompt's last forward left its distribution in the sc logits)
+    int t = sample_from(sc_ + sc_logits);
+    if (t < 0) {
+        err = "glm spec1: the sampler";
+        return false;
+    }
+    t = forced(t);
+    sp.counter += 1;
+    last_tok_ = t;
+    ++produced;
+    if (!emit(t)) return true;
+    int d = mtp_draft(t, err);
+    if (d < 0) return false;
+    for (;;) {
+        if (pos_ + 2 > max_ctx_ || produced >= max_new) return true;   // the pending stands unforwarded
+        int32_t toks[2] = {t, d};
+        if (!fast_verify2(pos_, toks, err)) return false;
+        ++spec_steps_;
+        int t2 = sample_from(spec1_logits_);
+        if (t2 < 0) {
+            err = "glm spec1: the sampler";
+            return false;
+        }
+        t2 = forced(t2);
+        sp.counter += 1;
+        last_tok_ = t2;
+        ++produced;
+        const bool hit = t2 == d;
+        if (hit) ++spec_hits_;
+        if (!emit(t2)) return true;   // the state may stand a position past the last emit - as decode_spec's
+        int tnext;
+        if (hit) {
+            tnext = sample_from(spec1_logits_ + g.n_vocab);
+        } else {
+            rollback();
+            pos_ -= 1;   // the pass's first position stands; the second is redone below with the true token
+            if (!fast_token(t2, err)) return false;
+            tnext = sample_from(sc_ + sc_logits);
+            // the redo's final hidden (h at pos_-1) is the catch-up's input: keep it in spec1_h_[1]
+            cudaMemcpyAsync(spec1_h_ + g.n_embd, F->head_x, (size_t) g.n_embd * sizeof(float),
+                            cudaMemcpyDeviceToDevice, F->cs);
+            cudaStreamSynchronize(F->cs);
+        }
+        if (tnext < 0) {
+            err = "glm spec1: the sampler";
+            return false;
+        }
+        tnext = forced(tnext);
+        sp.counter += 1;
+        last_tok_ = tnext;
+        ++produced;
+        if (!emit(tnext)) return true;
+        // the draft block's catch-up, one position per confirmed token (each call writes its cell for the next
+        // and clobbers head_x, so the hidden states are staged through spec1_h_): (p0, t2) first - its
+        // prediction for p0+2 is discarded, tnext is sampled already - then (p0+1, tnext) yields the draft for
+        // the round after next's position
+        cudaMemcpyAsync(F->head_x, spec1_h_, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        cudaStreamSynchronize(F->cs);
+        if (!fast_mtp(pos_ - 2, t2, err)) return false;   // (p0, t2): the cell at p0+1; its prediction discarded
+        cudaMemcpyAsync(F->head_x, spec1_h_ + g.n_embd, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice,
+                        F->cs);
+        cudaStreamSynchronize(F->cs);
+        d = mtp_draft(tnext, err);   // predicts the token after tnext's position = the next round's draft
+        if (d < 0) return false;
+        t = tnext;
+    }
+}
+
 // ---------------------------------------------------------------- conversation reuse
 // The sequence state that cannot be rebuilt from the position alone is the KDA layers' recurrent state and conv
 // history (one contiguous run per KDA layer in state_); the DSA caches are append-only, so restoring the position

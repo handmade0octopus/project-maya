@@ -1297,6 +1297,12 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec1_ready()) {
+            // single GPU: the paired-pass speculative decode (one batched trunk pass per two tokens)
+            if (!model.decode_spec1(sp, max_new, on_token, produced, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
         } else {
             // STRATA_GLM_MTP_PROBE=1 (with STRATA_GLM_MTP=1 so the block is loaded on one GPU): run the NextN
             // draft block alongside the normal decode - behaviour unchanged - and count how often its draft equals
