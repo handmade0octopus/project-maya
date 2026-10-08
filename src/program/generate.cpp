@@ -1160,6 +1160,7 @@ static int glm_pack_generate(const Options& o) {
             return produced < max_new;
         };
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
+        uint64_t mtp_probe_n = 0, mtp_probe_hit = 0;
         if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
@@ -1169,6 +1170,11 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         } else {
+            // STRATA_GLM_MTP_PROBE=1 (with STRATA_GLM_MTP=1 so the block is loaded on one GPU): run the NextN
+            // draft block alongside the normal decode - behaviour unchanged - and count how often its draft equals
+            // the token actually produced (the acceptance ceiling of single-GPU speculation)
+            const bool mtp_probe = getenv("STRATA_GLM_MTP_PROBE") != nullptr && model.has_mtp();
+            int probe_draft = -1;
             for (;;) {
                 if (stop_req.load()) {
                     finish = "cancel";
@@ -1180,13 +1186,30 @@ static int glm_pack_generate(const Options& o) {
                     return 1;
                 }
                 tok = model.forced(tok);
+                if (mtp_probe && probe_draft >= 0) {
+                    ++mtp_probe_n;
+                    mtp_probe_hit += probe_draft == tok;
+                }
                 sp.counter += 1;
                 if (!on_token(tok)) break;
                 if (!model.forward({(int32_t) tok}, lg, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (mtp_probe) {
+                    std::string perr;
+                    probe_draft = model.mtp_draft(tok, perr);
+                    if (probe_draft < 0) {
+                        std::fprintf(stderr, "glm mtp probe: %s - probe off\n", perr.c_str());
+                        probe_draft = -1;
+                    }
+                }
             }
+            if (mtp_probe_n > 0)
+                std::fprintf(stderr, "glm mtp probe: %llu of %llu drafts hit (%.1f%%)\n",
+                             (unsigned long long) mtp_probe_hit, (unsigned long long) mtp_probe_n,
+                             100.0 * (double) mtp_probe_hit / (double) mtp_probe_n);
+            mtp_probe_n = mtp_probe_hit = 0;
         }
         const auto t2 = std::chrono::steady_clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
