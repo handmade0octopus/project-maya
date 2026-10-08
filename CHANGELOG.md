@@ -3,6 +3,77 @@
 Every release is on GitHub (Releases) with these notes; every published change moves the last number. Update: `git pull`, then `./setup.sh` (Windows:
 `START-MAYA.bat`) - it recompiles only what changed and starts.
 
+## v1.0.14 - 2026-10-08
+
+Maya runs on two AMD GPUs (experimental), with MTP drafting on the second card, contributed by @boxwrench.
+
+- **Two AMD GPUs (#14 by @boxwrench):** `./maya.sh --backend hip --gpus 0,1` splits the layers across two supported
+  cards (RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070; they may be different models), and the second card runs
+  the MTP block that drafts the next token. Setup puts the card with more VRAM first and writes one hipBLASLt tuning
+  table per card's architecture (`STRATA_HIPBLASLT_TUNING` takes a `:`-separated list). Measured by @boxwrench with
+  Maya-S on an R9700 + RX 7900 XT: decode (writing the answer) about 33 tokens/s against about 15 on the RX 7900 XT
+  alone, prefill (reading the prompt) about 490 tokens/s on a 4K-token prompt against about 414. docs/AMD_MAYA.md has
+  the details.
+- NVIDIA: unchanged - the change is in the AMD setup and the AMD-only prompt GEMM code; every NVIDIA target builds.
+- We have no AMD hardware; these results are the contributor's.
+
+## v1.0.13 - 2026-10-08
+
+Tool calls work: GLM-5.3-Flash's function calls reach your apps and coding agents instead of ending the request.
+
+- **Tool calls (issue #5, reported by @xldistance):** GLM-5.x writes its calls in its own form
+  (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`), and the server read only another
+  model family's form, so every tool call ended the request with "malformed tool call" - in the chat's tools, MCP,
+  and every OpenAI or Anthropic client (Claude Code, agents). Both forms are read now, whole and streamed (the call's
+  name as soon as it is written, then its arguments piece by piece), and checked end to end: the call, its result
+  in the next turn, both APIs.
+- **A call only quoted in the answer stays text:** a `<tool_call>` inside a code block or inline code (an example the
+  model shows) is never run - an example `rm -rf` must not reach your shell (from Strata #1058).
+- **A stuck engine is restarted:** an engine that says nothing for 90 s and in that time uses no CPU, disk or GPU is
+  ended, the request gets an error, and the next request starts it again; a silent engine that is working (a long
+  prompt on a slow PC) is never ended (`STRATA_ENGINE_STALL_S`, `0` = off; from Strata #1317).
+- **The server, from Strata 0.1.41:** up to 256 connections wait to be accepted (an agent opening many at once got
+  "connection reset"; `STRATA_HTTP_BACKLOG`); a request body is checked before it is read (a bad Content-Length is a
+  400, one over 256 MiB a 413 - `STRATA_MAX_BODY_MIB`), relays' chunked bodies are read, and a malformed request is
+  a 400 with its traceback in the server log instead of a dropped connection; `--api-key` takes several keys
+  (`KEY1,KEY2`, or a list in the config).
+- `--env` now also reaches these server settings (the rest still go to the engine).
+- Checked: 92 server tests (12 new for tool calls, 10 for the rest); the engine is unchanged from v1.0.12.
+
+## v1.0.12 - 2026-10-08
+
+Maya runs on up to 16 GPUs and reads long prompts much faster on one GPU, contributed by @needmorevram.
+
+- **Up to 16 GPUs (#12 by @needmorevram):** `--gpus 0,1,2,...` takes up to 16 GPUs (two before). Two GPUs split the
+  layers in the middle as before; with more, each GPU takes a share sized to its free VRAM (`STRATA_GLM_SPLIT` or the
+  config's `"layer_split"` pin it). Measured by @needmorevram on nine GPUs (8x RTX 5060 Ti 16 GB + an RTX 3090):
+  decode (writing the answer) about 28 tokens/s, prefill (reading the prompt) 1,150-1,210 tokens/s on 8K-token
+  prompts.
+- **Prefill on one GPU:** bigger prompt chunks (up to 32,768 tokens, sized from the free VRAM); each expert's output
+  added in as soon as it's computed, so a chunk holds about twice the tokens; the least-used RAM-tier experts computed
+  on the CPU while the GPU loads the rest; experts copied to the GPU while the attention runs; faster sparse-attention
+  scoring; a tensor-core attention kernel for Ampere and newer. 1x Tesla V100 with Maya-S: 2K / 8K / 16K-token prompts
+  267 / 373 / 362 -> 263 / 578 / 620 tokens/s. 2x V100: 293 / 485 / 553 -> 313 / 541 / 674 tokens/s.
+- **Decode with most experts in RAM:** hot RAM-tier experts move into VRAM in the background while it answers
+  (`STRATA_GLM_PROMOTE`), and on two-socket machines the RAM tier is spread over both sockets' memory. On
+  @needmorevram's RTX 3090 with GSQ-RCO 3.5-bit: 15.3 -> 18.7-19.9 tokens/s. 1x and 2x V100 with Maya-S: unchanged
+  (17.1 and about 27.6 tokens/s).
+- **GSQ-RCO 3.5-bit download:** a community quant (137.1 GB, by pfeifferj, MIT) in the setup's model question, or
+  `--model GSQ-RCO-3.5bit`; checked against its sha256. It is not a Project Maya quant and is not measured by us.
+- **`./maya.sh --calibrate`:** measures decode with a few CPU-lane settings (how many RAM-tier experts go over PCIe
+  instead of to the CPU, and how many CPU threads) and keeps one only if it is more than 3% faster (README > Tuning).
+- **`--models-dir`** names the folder downloaded models go to (`--data-dir` before; older configs still work).
+- **Our follow-ups to #12:**
+  - Builds for Volta / Turing (V100, RTX 20) and Windows again: the new attention kernel compiles only for Ampere and
+    newer, the page-cache drop is Linux-only, and the AVX-512 kernel converts FP16 in a way MSVC accepts.
+  - One GPU beside a 6-core CPU kept its decode speed: the CPU's share of each token is cut into about 48 pieces in
+    all (`STRATA_GLM_CPU_SPLIT`). One piece per thread, as submitted, took 1x V100 from 17.0 to 14.3 tokens/s; now
+    17.1. Machines with 40 or more threads still stream one piece each.
+  - The tokenizer remembers what it has read: a 220K-token agent prompt is tokenized in 0.23 s instead of 0.89 s, and
+    in 0.013 s when it is sent again with a new turn (the same token ids).
+- **Checked:** the engine's parity tests pass on 1x and 2x V100. On held-out text the model's loss stays within
+  v1.0.11's run-to-run noise; on one GPU it now varies a little more from run to run.
+
 ## v1.0.11 - 2026-10-08
 
 Maya runs on AMD GPUs (experimental): RX 7900 XT / XTX and Radeon AI PRO R9700 / RX 9070 on Linux, contributed by
