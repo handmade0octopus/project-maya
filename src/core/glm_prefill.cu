@@ -610,6 +610,9 @@ void Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped) {
     FastState* F = fast_;
     fast_boundary();                   // finished promotions and demotions go live (the plan reads the tables)
     cudaStreamSynchronize(F->copy);    // every demotion issued so far has read its slot
+    if (F->ram_resident) fast_boundary();   // resident mode keeps VRAM entries live until the copy lands: the
+                                            // synced demotions must publish their RAM copies before the tail
+                                            // (a demote's source slot could sit in the lend region) is borrowed
     const int NE = g_.n_expert;
     {
         std::lock_guard<std::mutex> lk(F->mu);
@@ -632,6 +635,31 @@ void Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped) {
         };
         // STRATA_GLM_LEND_DROP=1: drop the lent slots' experts as before (instead of moving them, below)
         static const bool lend_drop = getenv("STRATA_GLM_LEND_DROP") != nullptr;
+        // RAM-resident mode: a displaced expert moves to a free RAM-tier slot (a D2H copy on the compute stream,
+        // complete by the flush below) instead of becoming disk-only; a no-slot fallback keeps the old drop and
+        // counts it - with the resident slack there should always be a free slot
+        const auto demote_to_ram = [&](int key_, int il_, uint8_t* src) -> bool {
+            if (!F->ram_resident || F->ram_of[(size_t) key_] >= 0) return F->ram_resident;
+            auto& R = F->rc[(size_t) F->layer_rc[(size_t) il_]];
+            int rs = -1;
+            for (int s2 = 0; s2 < R.n; ++s2)
+                if (R.st[(size_t) s2] == FastState::kRFree) {
+                    rs = s2;
+                    break;
+                }
+            if (rs < 0) {
+                ++F->diag_resident_skip;
+                return false;
+            }
+            cudaMemcpyAsync(R.base + (size_t) rs * R.stride, src, F->L[(size_t) il_].blob, cudaMemcpyDeviceToHost,
+                            F->cs);
+            R.key[(size_t) rs] = key_;
+            R.tick[(size_t) rs] = F->clock;
+            R.st[(size_t) rs] = FastState::kRHold;
+            F->ram_of[(size_t) key_] = rs;
+            upd(F->rtab_key((size_t) key_), (unsigned long long) (R.base + (size_t) rs * R.stride));
+            return true;
+        };
         for (int il = l0_; il < lt_; ++il) {
             if (!F->L[(size_t) il].moe) continue;
             auto& P = F->lp[(size_t) il];
@@ -656,20 +684,22 @@ void Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped) {
                     if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
                         const int v = cold[ci++].second;   // the coldest: it goes, this expert takes its slot
                         const int vkey = il * NE + P.key[(size_t) v];
+                        const bool kept = demote_to_ram(vkey, il, P.slot_ptr(v));   // before the D2D overwrites it
                         cudaMemcpyAsync(P.slot_ptr(v), P.slot_ptr(s), F->L[(size_t) il].blob, cudaMemcpyDeviceToDevice,
                                         F->cs);
                         upd(F->tab_key((size_t) vkey), 0ull);
                         F->slot_of[(size_t) vkey] = -1;
-                        F->left[(size_t) vkey] = 3;
+                        if (!kept) F->left[(size_t) vkey] = 3;
                         upd(F->tab_key((size_t) key), (unsigned long long) P.slot_ptr(v));
                         F->slot_of[(size_t) key] = v;
                         P.key[(size_t) v] = P.key[(size_t) s];
                         P.tick[(size_t) v] = P.tick[(size_t) s];
                         ++moved;
                     } else {
+                        const bool kept = demote_to_ram(key, il, P.slot_ptr(s));
                         upd(F->tab_key((size_t) key), 0ull);
                         F->slot_of[(size_t) key] = -1;
-                        F->left[(size_t) key] = 3;
+                        if (!kept) F->left[(size_t) key] = 3;
                     }
                     ++dropped;
                     ++F->diag_lend;
