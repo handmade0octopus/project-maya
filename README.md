@@ -1,7 +1,7 @@
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>Run GLM-5.3-Flash - a 321-billion-parameter AI model - on your own NVIDIA GPU(s)</b><br>
-One or two NVIDIA GPUs · Linux, Windows (experimental) · chat in the browser, pictures, OpenAI- and
+<p align="center"><b>Run GLM-5.3-Flash - a 321-billion-parameter AI model - on your own GPU(s)</b><br>
+One or two NVIDIA GPUs, AMD (experimental) · Linux, Windows (experimental) · chat in the browser, pictures, OpenAI- and
 Anthropic-compatible API</p>
 
 <p align="center"><a href="https://buymeacoffee.com/peasantsmith">☕ Support Project Maya - buy me a coffee</a></p>
@@ -16,7 +16,10 @@ Maya grew out of [Strata](https://github.com/Niko1221/Strata) (MIT): its engine 
 for GLM-5.3-Flash (the expert tiers across VRAM, RAM and SSD, the two-GPU split, MTP decoding), and its server and
 dashboard started from Strata's and were reworked for Maya (a new dashboard, images on demand, the thinking budget).
 
-## The model: Maya-S
+**AMD (experimental):** Linux on RX 7900 XT / XTX and R9700 / RX 9070, one GPU, text only - see
+[docs/AMD_MAYA.md](docs/AMD_MAYA.md).
+
+## The models: Maya-S and Maya-M
 
 Maya installs **Maya-S**, Project Maya's own compact quant of GLM-5.3-Flash (96.5 GB,
 [on Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)), made for PCs with a smaller memory
@@ -29,28 +32,45 @@ WinoGrande, PIQA; 400 questions each, the same for both models). On held-out tex
 FP8 model 83% of the time, and it writes long answers (6,000-14,000 tokens) without looping.
 Details: [bench/results/MAYA-S.md](bench/results/MAYA-S.md).
 
+**Maya-M** (116 GB) is the larger quant, made for PCs with a bigger memory pool across RAM and VRAM: more bits where
+they count - IQ2_S gate/up experts, IQ3_XXS down projections and IQ3_S in the most sensitive layers - with the same
+FP8 statistics and error-feedback rounding, calibrated toward tool calls and front-end code. It is closer to the FP8
+model than Maya-S token by token: 23% lower KL divergence, and it picks the same next token as the FP8 model 86%
+of the time; on the zero-shot tasks both keep 97.9% of the FP8 model's accuracy. Set it
+up with `./setup.sh --setup --model Maya-M` (Windows: `START-MAYA.bat --setup --model Maya-M`).
+Details: [bench/results/MAYA-M.md](bench/results/MAYA-M.md).
+
 ## How fast is it?
 
-Measured with Maya-S through the dashboard. A token is about ¾ of a word.
+Measured with Maya-S. A token is about ¾ of a word. `./maya.sh --bench` measures your machine the same way.
 
 | Machine | Decode (writing the answer) | Prefill (reading your prompt) |
 | --- | ---: | ---: |
-| **2x Tesla V100 32 GB** (PCIe 3), Xeon E5-2690 v4, 30 GB RAM, one NVMe | **up to 40 tokens/s** | **up to 500 tokens/s** |
+| **2x Tesla V100 32 GB** (PCIe 3), Xeon E5-2690 v4, 30 GB RAM, one NVMe | **up to 40 tokens/s** | **up to 560 tokens/s** |
+| **1x Tesla V100 32 GB** (PCIe 3), Core i5-12600T, 64 GB RAM, one NVMe | **up to 19 tokens/s** | **up to 370 tokens/s** |
 
 - The speed holds with context: the attention's selection step is linear in the context length, so a 60K-token
   conversation keeps answering fast.
 - The first answers after a start are the slowest: the expert caches fill with the experts your conversations use.
 - Every machine is different: the engine adapts to the GPUs, RAM and SSD it finds, so your speed depends on your
-  hardware. Single-GPU numbers are being measured; tell us what you get on yours.
+  hardware. A second GPU in a narrow slot (PCIe x4) still helps: the engine measures each card's link and lets the
+  CPU compute more of that card's RAM-tier experts instead of copying them over.
+
+**Measured by users** with `./maya.sh --bench` (Maya-S, 32K context). Send yours: `--bench`, then `--report`, in a
+[GitHub issue](https://github.com/mw00/project-maya/issues).
+
+| Machine | Decode (writing the answer) | Prefill (reading your prompt) | By |
+| --- | ---: | ---: | --- |
+| **2x NVIDIA TITAN RTX 24 GB** (Turing; the second card in a PCIe 3 x4 slot), Core i5-12490F, 48 GB RAM | 13.5 tokens/s (mean of 3 answers) | 238 tokens/s (8K-token prompt) | @dummerjindabin (v1.0.6 with the v1.0.7 fix) |
 
 ## What you need
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA, compute capability 7.0 or newer (V100 and newer); one GPU, or two that share the model (each holds half of the layers). The engine fills whatever VRAM you have with the most-used experts: more VRAM is faster. Measured: 1 and 2x V100 32 GB. |
+| **GPU** | NVIDIA, compute capability 7.0 or newer (V100 and newer); one GPU, or two that share the model (each holds half of the layers). The engine fills whatever VRAM you have with the most-used experts: more VRAM is faster. Measured: 1 and 2x V100 32 GB; by users: 2x TITAN RTX (above). **AMD (experimental):** RX 7900 XT / XTX and Radeon AI PRO R9700 / RX 9070, one GPU, text only ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)). |
 | **RAM** | It runs with **32 GB** (the machine in the table above has 30 GB). More RAM keeps more experts close and is faster; what does not fit is read from the SSD while it answers. |
 | **Disk** | **~100 GB free on a fast NVMe SSD** (the model is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers). Not a hard disk. |
-| **System** | Linux (x86-64, CPU with AVX2), NVIDIA driver, CUDA toolkit 12.x (CUDA 13 can be used for Turing and newer, but it no longer compiles for Volta/V100), g++, Python 3.10+. Windows 10/11: experimental, with Visual Studio 2022 Build Tools instead of g++ ([Windows](#windows)). Not WSL2. |
+| **System** | Linux (x86-64, CPU with AVX2), NVIDIA driver, CUDA toolkit 12.x (CUDA 13 can be used for Turing and newer, but it no longer compiles for Volta/V100), g++, Python 3.10+. Windows 10/11: experimental, with Visual Studio 2022 Build Tools instead of g++ ([Windows](#windows)). Not WSL2. AMD: Linux with ROCm 7 instead of the NVIDIA driver and CUDA. |
 
 The installer checks all of this and prints the exact command for anything missing. It installs nothing
 system-wide by itself.
@@ -60,7 +80,8 @@ system-wide by itself.
 **You need:** an NVIDIA GPU (V100 / RTX 20 or newer) on Linux (Windows: [experimental](#windows)), ~100 GB free on
 an NVMe SSD, a current NVIDIA driver
 and the CUDA toolkit (12.x for a V100; the engine is compiled for your GPU). Everything else - Python, the engine, the
-model - is set up for you, the way Strata does it.
+model - is set up for you, the way Strata does it. On an AMD RX 7900 XT / XTX or R9700 / RX 9070 (experimental, Linux,
+ROCm 7): `./maya.sh --backend hip --gpu 0 --check` first, then [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
 
 1. Get Project Maya:
    ```sh
@@ -143,6 +164,8 @@ RAM experts the CPU computes itself. These settings change that (put them in the
 | `STRATA_GLM_SPLIT` | middle (+2) with 2 GPUs | the first layer of the second GPU; `0` = one GPU |
 | `STRATA_GLM_CPU_LANE` | one thread per physical core | CPU threads for RAM-tier experts; `0` = off |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | where your expert usage is kept between starts (the warm-up loads your experts first); `0` = off |
+| `STRATA_GLM_SLOTS` | 4 | conversations kept aside on the SSD, so switching back to one doesn't re-read its prompt; `0` = off |
+| `STRATA_GLM_SLOT_MIN`, `STRATA_GLM_SLOT_GB`, `STRATA_GLM_SLOT_DIR` | 1024, 16, `<pack>/slots` | the shortest conversation kept aside (tokens), their total size on disk (GB), and the folder |
 | `STRATA_GLM_TIMING`, `STRATA_GLM_POOL_STATS` | off | `1` = timing and cache statistics in the engine log |
 
 ## Something went wrong?
@@ -151,6 +174,9 @@ RAM experts the CPU computes itself. These settings change that (put them in the
 a slow answer or the error, and attach the `maya-report.txt` it writes in the Maya folder. It holds your GPUs, CPU,
 RAM and disks, your Maya setup and the engine's speed lines - where the time goes, token by token - so the engine
 can be tuned for your machine. Nothing is sent anywhere; your home folder shows as `~` and no API key is included.
+For a speed report, also run **`./maya.sh --bench`** with Maya stopped (Windows: `START-MAYA.bat --bench`): a
+standard test of a few minutes - decode on three questions, prefill at 2k and 8k tokens - that writes
+`maya-bench.txt`, which the report then includes.
 
 - **"nvcc ... cannot build for these GPUs"** - Volta needs CUDA 12.x; Blackwell needs 12.8 or newer. Several toolkits
   can be installed side by side; the installer takes the newest that fits.

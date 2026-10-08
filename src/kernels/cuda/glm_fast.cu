@@ -7,7 +7,9 @@
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
 
+#if !defined(STRATA_USE_HIP)
 #include <cuda_bf16.h>
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -20,6 +22,15 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+
+#if defined(STRATA_USE_HIP)
+// The HC grid exchanges FP32 partials between workgroups. An agent-scope
+// acquire load preserves visibility after their publication fences; HIP only
+// supplies CUDA's __ldcg spelling for half types.
+__device__ __forceinline__ float __ldcg(const float* p) {
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+}
+#endif
 
 namespace strata::kernels::glmf {
 namespace {
@@ -847,6 +858,23 @@ __global__ void __launch_bounds__(256) mv_kernel(const __grid_constant__ MvBatch
     if (lane == 0) J.y[row] = J.alpha * s + (J.bias ? J.bias[row] : 0.0f);
 }
 
+// ... the same for jobs of ONE quantized type: compiled for that type alone (the switch over every type costs the
+// generic kernel registers and occupancy - a Q6_K 8192 x 4096 GEMV on a V100: 53.4 -> 47.8 us, the same arithmetic)
+template<int T>
+__global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBatch b) {
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int row = (bid - blk0) * MV_ROWS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= J.n_out) return;
+    const float s = row_dot<T>((const uint8_t*) J.w + (size_t) row * rbytes<T>(J.n_in), (const block_q8_1*) J.xq,
+                               J.n_in, lane);
+    if (lane == 0) J.y[row] = J.alpha * s + (J.bias ? J.bias[row] : 0.0f);
+}
+
 __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n % 32 == 0: whole warps only
@@ -1366,6 +1394,9 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
     }
 }
 
+// the DSA latent cache is FP16 (uint16_t bits): read / written in F32
+__device__ __forceinline__ float lat_f(uint16_t v) { return __half2float(__ushort_as_half(v)); }
+__device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__float2half(v)); }
 // ---------------------------------------------------------------- DSA
 __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ DsaPrepArgs a) {
     __shared__ float sred[32];
@@ -1393,7 +1424,7 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
         float v = tid < a.kv_lora ? a.kv_raw[tid] : 0.0f;
         const float ss = block_sum(v * v, sred);
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
-        if (tid < a.kv_lora) a.lat[(size_t) a.kv_lora * a.p + tid] = v * inv * a.kv_norm[tid];
+        if (tid < a.kv_lora) a.lat[(size_t) a.kv_lora * a.p + tid] = lat_h(v * inv * a.kv_norm[tid]);
         return;
     }
     // block 2: the indexer key (layer norm) and the compressor gate into their caches; the pool
@@ -1470,7 +1501,7 @@ __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restric
 // One block per head: q_abs = wk_b_h . q_h (kv_lora rows of qk_nope), scores over the selected latents,
 // softmax, ctx, out = wv_b_h . ctx (v_head rows of kv_lora), q8_1 of out.
 __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, const uint16_t* __restrict__ wk_b,
-                                                  const uint16_t* __restrict__ wv_b, const float* __restrict__ lat,
+                                                  const uint16_t* __restrict__ wv_b, const uint16_t* __restrict__ lat,
                                                   const int* __restrict__ cells, int n_sel, int qk_nope, int kv_lora,
                                                   int v_head, block_q8_1* __restrict__ out) {
     extern __shared__ float smem[];
@@ -1497,9 +1528,9 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
         const int cell = cells[s];
         float dot = -INFINITY;
         if (cell >= 0) {
-            const float* lr = lat + (size_t) kv_lora * cell;
+            const uint16_t* lr = lat + (size_t) kv_lora * cell;
             float acc = 0.0f;
-            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lr[e];
+            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lat_f(lr[e]);
             dot = warp_sum(acc) * scale;
         }
         if (lane == 0) s_p[s] = dot;
@@ -1520,7 +1551,7 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
         float acc = 0.0f;
         for (int s = 0; s < n_sel; ++s) {
             const int cell = cells[s];
-            if (cell >= 0) acc += (s_p[s] * invd) * lat[(size_t) c + (size_t) kv_lora * cell];
+            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat[(size_t) c + (size_t) kv_lora * cell]);
         }
         s_ctx[c] = acc;
     }
@@ -1563,7 +1594,7 @@ __global__ void __launch_bounds__(256) headwise_gemv_kernel(const uint16_t* __re
     }
 }
 
-__global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const float* __restrict__ lat,
+__global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                        const int* __restrict__ cells, int n_sel, int qk_nope,
                                                        int kv_lora, float* __restrict__ ctx) {
     extern __shared__ float smem[];
@@ -1578,9 +1609,9 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
         const int cell = cells[s];
         float dot = -INFINITY;
         if (cell >= 0) {
-            const float* lr = lat + (size_t) kv_lora * cell;
+            const uint16_t* lr = lat + (size_t) kv_lora * cell;
             float acc = 0.0f;
-            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lr[e];
+            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lat_f(lr[e]);
             dot = warp_sum(acc) * scale;
         }
         if (lane == 0) s_p[s] = dot;
@@ -1601,7 +1632,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
         float acc = 0.0f;
         for (int s = 0; s < n_sel; ++s) {
             const int cell = cells[s];
-            if (cell >= 0) acc += (s_p[s] * invd) * lat[(size_t) c + (size_t) kv_lora * cell];
+            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat[(size_t) c + (size_t) kv_lora * cell]);
         }
         ctx[(size_t) kv_lora * h + c] = acc;
     }
@@ -1613,14 +1644,15 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
 // selected cells this reads the latents once per layer instead of once per head (64x less).
 // The grid is (chunks, head groups of MLA_HPB): ~20 chunks at 600 cells would leave most SMs idle with every head in
 // one block (208 us a call on a V100); a group re-reads its chunk's latents, which is cheap next to the arithmetic.
+// The latents stay FP16 in shared memory, as in the cache (34 KB at kv_lora 512; F32 rows were over Turing's 64 KB).
 constexpr int MLA_CHUNK = 32;
 constexpr int MLA_HPB = 16;
-__global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict__ q_abs, const float* __restrict__ lat,
+__global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                         const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
                                                         int kv_lora, float* __restrict__ part) {
     extern __shared__ float smem[];
-    float* sL = smem;                                  // MLA_CHUNK x kv_lora
-    float* sS = sL + MLA_CHUNK * kv_lora;              // MLA_HPB x MLA_CHUNK scores -> weights
+    uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x kv_lora, FP16
+    float* sS = smem + MLA_CHUNK * kv_lora / 2;        // MLA_HPB x MLA_CHUNK scores -> weights
     __shared__ int s_cell[MLA_CHUNK];
     const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
     const int h0 = blockIdx.y * MLA_HPB, nh = min(MLA_HPB, n_head - h0);
@@ -1631,7 +1663,7 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
     for (int i = tid; i < MLA_CHUNK * kv_lora; i += blockDim.x) {
         const int s = i / kv_lora, c = i - s * kv_lora;
         const int cell = s_cell[s];
-        sL[i] = cell >= 0 ? lat[(size_t) kv_lora * cell + c] : 0.0f;
+        sL[i] = cell >= 0 ? lat[(size_t) kv_lora * cell + c] : (uint16_t) 0;
     }
     __syncthreads();
     const float scale = rsqrtf((float) qk_nope);
@@ -1645,7 +1677,7 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
             float acc = 0.0f;
 #pragma unroll
             for (int j = 0; j < 16; ++j)
-                if (lane + 32 * j < kv_lora) acc += q[j] * sL[s * kv_lora + lane + 32 * j];
+                if (lane + 32 * j < kv_lora) acc += q[j] * lat_f(sL[s * kv_lora + lane + 32 * j]);
             acc = warp_sum(acc);
             if (lane == 0) sS[hh * MLA_CHUNK + s] = s_cell[s] >= 0 ? acc * scale : -INFINITY;
         }
@@ -1670,7 +1702,7 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
         const int hh = i / kv_lora, c = i - hh * kv_lora;
         float acc = 0.0f;
 #pragma unroll 8
-        for (int s = 0; s < MLA_CHUNK; ++s) acc += sS[hh * MLA_CHUNK + s] * sL[s * kv_lora + c];
+        for (int s = 0; s < MLA_CHUNK; ++s) acc += sS[hh * MLA_CHUNK + s] * lat_f(sL[s * kv_lora + c]);
         pm[(size_t) hh * (kv_lora + 2) + c] = acc;
     }
 }
@@ -2013,6 +2045,11 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid == 0) {
         __threadfence_system();
         rq->seq = s_seq;
+#if defined(__HIPCC__)
+        // The CPU polls this signal without a stream query. As in Strata #697,
+        // publish the signal itself after publishing the request payload.
+        __threadfence_system();
+#endif
     }
 }
 
@@ -2658,19 +2695,49 @@ size_t row_bytes(int type, int64_t n_in) {
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > kMaxMvJobs) return false;
-    MvBatch b{};
-    int acc = 0;
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n; ++i)
         if (!mv_type_ok(jobs[i].type)) {
             std::fprintf(stderr, "glm_fast mv: type %d unsupported\n", jobs[i].type);
             return false;
         }
-        b.j[i] = jobs[i];
-        acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
-        b.blk_end[i] = acc;
+    // the jobs of the common dense types go to a kernel compiled for their type (one launch per type present), the
+    // rest to the generic one; the jobs are independent, so their order does not matter
+    static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
+    constexpr int kTyped[] = {14, 8, 12, 13};
+    bool done[kMaxMvJobs] = {};
+    if (typed) {
+        for (const int T : kTyped) {
+            MvBatch b{};
+            int acc = 0, m = 0;
+            for (int i = 0; i < n; ++i)
+                if (jobs[i].type == T) {
+                    b.j[m] = jobs[i];
+                    acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+                    b.blk_end[m++] = acc;
+                    done[i] = true;
+                }
+            if (m == 0) continue;
+            b.n = m;
+            switch (T) {
+                case 14: mv_kernel_t<14><<<acc, 256, 0, s>>>(b); break;
+                case 8: mv_kernel_t<8><<<acc, 256, 0, s>>>(b); break;
+                case 12: mv_kernel_t<12><<<acc, 256, 0, s>>>(b); break;
+                case 13: mv_kernel_t<13><<<acc, 256, 0, s>>>(b); break;
+            }
+        }
     }
-    b.n = n;
-    mv_kernel<<<acc, 256, 0, s>>>(b);
+    MvBatch b{};
+    int acc = 0, m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (done[i]) continue;
+        b.j[m] = jobs[i];
+        acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+        b.blk_end[m++] = acc;
+    }
+    if (m > 0) {
+        b.n = m;
+        mv_kernel<<<acc, 256, 0, s>>>(b);
+    }
     launch_check("mv");
     return true;
 }
@@ -2761,7 +2828,7 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
     launch_check("dsa_select");
 }
 
-void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const float* lat, const int* cells, int n_sel,
+void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
          int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s) {
     // scratch for q_abs and ctx (n_head * kv_lora each), per device
     static float* scratch[16] = {};
@@ -2790,7 +2857,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const float
     static float* part[16] = {};
     static int part_chunks[16] = {};
     const int n_chunks = (n_sel + MLA_CHUNK - 1) / MLA_CHUNK;
-    const size_t smem = ((size_t) MLA_CHUNK * kv_lora + (size_t) MLA_HPB * MLA_CHUNK) * sizeof(float);
+    const size_t smem = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) MLA_HPB * MLA_CHUNK * sizeof(float);
     // the opt-in must be EXACTLY what the launch needs (or at most the device's opt-in minus the kernel's static
     // shared memory): asking for the whole 96 KB fails on a V100 (s_cell is static), and every launch then failed
     // with "invalid argument" - the attention silently contributed nothing (fixed 2026-10-06)

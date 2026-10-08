@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Project Maya - set up and start GLM-5.3-Flash on your own NVIDIA GPU(s).  Linux; Windows (experimental).
+"""Project Maya - set up and start GLM-5.3-Flash on your own GPU(s).
+CUDA: Linux; Windows (experimental). HIP: experimental Linux gfx1100/gfx1201, text only.
 
     ./maya.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./maya.sh --setup         set up again (other GPUs, another context length, another model folder)
     ./maya.sh --check         only check this PC
+    ./maya.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 7
 
 On Windows START-MAYA.bat takes the same options.  Both make the private Python environment (.venv, the way Strata's
-setup.sh does) and run this file.  It reuses Strata's installer (setup.py, imported unchanged) for the PC checks,
+setup.sh does) and run this file.  It reuses Strata's installer (setup.py) for the PC checks,
 pip, llama.cpp's source and resumable downloads.
 
 What the first run does (each step is skipped when it is already done):
 
   1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+, driver, CUDA toolkit (nvcc), the C++ compiler (g++;
-     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU
+     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201 and ROCm 7 instead
   2. asks: which GPUs (one, or two that split the layers), how much context
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
-  4. compiles the engine (`build/strata`) for your GPU(s): 10-30 minutes, once
+  4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the GGUF files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/strata-vision`) and fetches the model's vision files
-     (1.1 GB, shown and asked first like the model; --no-vision skips it)
+     (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows), and starts the dashboard on
      http://127.0.0.1:8080
 
@@ -79,6 +81,26 @@ MODELS = {
                 "2d65d88a69f8dc124c8d24bd33b33161ddab218918b4253ad4f500aeede84df5",
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00003-of-00003.gguf":
                 "a6a981c4fee7a53d78bdbd97d8f465d48ddf439cf938ff90617f395e0351b5a6"},
+        "vision": {
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    "Maya-M": {
+        "about": "Maya-M, Project Maya's larger quant: error-feedback-rounded IQ2_S gate/up experts, IQ3_XXS down "
+                 "projections (IQ3_S in the most sensitive layers), Q6_K attention, the MTP draft block, made from "
+                 "Z.ai's FP8 release",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-M",
+        "file": "GLM-5.3-Flash-Maya-M-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 116.0,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-M-00001-of-00003.gguf":
+                "3ac0f066ec45af3432d59b33de49bdfb29156432b627240b35769c7d02cc6c02",
+            "GLM-5.3-Flash-Maya-M-00002-of-00003.gguf":
+                "285951d2afa0cd98285b03d0dc4aa68d83daf1a6f4a2594fe40b0cdd27ade485",
+            "GLM-5.3-Flash-Maya-M-00003-of-00003.gguf":
+                "ebf1ce713f71207747e10eeebed87597969d8b5e1d9dd817420d2c2f7ca51e0e"},
         "vision": {
             "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
             "download_gb": 1.14,
@@ -159,7 +181,50 @@ def pick_cmake():
 
 
 def gpu_label(g) -> str:
+    if g.get("vendor") == "amd":
+        return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, {g['arch']})"
     return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, compute capability {S.cc(g)})"
+
+
+def select_build_backend(backend: str) -> None:
+    """Separate build folders and stamps prevent reusing a binary from the other backend."""
+    global BUILD, EXE, STAMP
+    BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
+    EXE = BUILD / ("strata.exe" if WIN else "strata")
+    STAMP = BUILD / "MAYA-BUILD.json"
+
+
+def check_hip_pc(a) -> dict:
+    if WIN or not sys.platform.startswith("linux") or S.is_wsl():
+        fail("Maya's experimental HIP backend requires native Linux")
+    found = S.amd_gpus()
+    usable = [g for g in found if g["arch"] in S.AMD_ARCHS]
+    for g in found:
+        say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
+    if not usable:
+        fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100) and RX 9070 / AI PRO R9700 (gfx1201)")
+    if a.gpus:
+        fail("Maya's HIP port currently uses one GPU", "select it with --gpu N")
+    chosen = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
+        usable, key=lambda g: g["vram_gb"])
+    if chosen is None:
+        fail(f"GPU {a.gpu} is not a supported AMD card")
+    root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm").resolve()
+    if not (root / "llvm/bin/clang++").exists() or not list((root / "lib").glob("libhipblas.so*")):
+        fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
+    if tool_version(str(root / "bin/hipcc")) < (7, 0):
+        fail("Maya's HIP port requires ROCm 7 or newer")
+    if not shutil.which("c++"):
+        fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+    cpu, avx2, avx512 = S.cpu_info()
+    if not avx2:
+        fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
+    total, avail = mem_gb()
+    ok(f"using {gpu_label(chosen)}; experimental HIP, one GPU, text only")
+    ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
+    ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
+    select_build_backend("hip")
+    return {"backend": "hip", "gpus": [chosen], "archs": ["gfx1100", "gfx1201", "gfx1151"], "rocm": str(root)}
 
 
 def nvcc_range(archs) -> tuple:
@@ -262,6 +327,8 @@ def choose_gpus(a, found) -> list:
 
 def check_pc(a) -> dict:
     step(1, "checking this PC")
+    if a.backend == "hip":
+        return check_hip_pc(a)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
     if WIN:
@@ -361,7 +428,9 @@ def check_pc(a) -> dict:
             say(f"       {how}")
         fail("something Maya needs is missing (above)",
              f"install it and run {ME} again - this script installs nothing system-wide")
-    return {"gpus": chosen, "archs": archs, "nvcc": nvcc, "vcvars": str(S.find_vcvars()) if WIN else None}
+    select_build_backend("cuda")
+    return {"backend": "cuda", "gpus": chosen, "archs": archs, "nvcc": nvcc,
+            "vcvars": str(S.find_vcvars()) if WIN else None}
 
 
 # ------------------------------------------------------------------------------------------------ 2. choices
@@ -569,10 +638,48 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     return (nvccs[0] if nvccs else nvcc_given), hc_given
 
 
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | None:
+    root = Path(pc["rocm"])
+    cmake = pick_cmake()
+    if not cmake:
+        fail("CMake 3.24 or newer is needed")
+    env = dict(os.environ, HIP_PLATFORM="amd", HIP_COMPILER="clang", HIP_RUNTIME="rocclr",
+               ROCM_PATH=str(root), HIP_PATH=str(root))
+    env["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm/bin"), env.get("PATH", "")])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join([str(root / "lib"), env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    # Keep compiler-cache writes inside this project, including when run in a workspace sandbox.
+    env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
+    conf = [cmake, "-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
+            "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
+            "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
+            f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
+            f"-DCMAKE_HIP_COMPILER={root / 'llvm/bin/clang++'}", f"-DCMAKE_PREFIX_PATH={root}",
+            f"-DSTRATA_GGML_DIR={llama}"]
+    jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
+    say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env, ""):
+        if soft:
+            warn("HIP rebuild failed; starting the previous engine")
+            return None
+        fail("the HIP engine build failed", "see the compiler output above")
+    meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
+            "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
+            "lib_dirs": [str(root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M")}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"engine compiled: {EXE}")
+    return meta
+
+
 def build_step(a, pc, llama: Path) -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
     meta = read_json(STAMP)
+    if pc.get("backend") == "hip":
+        if (EXE.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
+                and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]):
+            ok(f"HIP engine already compiled: {EXE}")
+            return meta
+        return compile_engine_hip(pc, llama, src)
     if (EXE.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
             and (not a.nvcc or a.nvcc == meta.get("nvcc"))
             and (not a.host_compiler or a.host_compiler == meta.get("host_compiler"))):
@@ -590,6 +697,16 @@ def refresh_engine(cfg: dict) -> None:
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src:
+        return
+    if cfg.get("backend") == "hip":
+        root = Path(meta.get("rocm") or "/opt/rocm")
+        llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
+        if not (root / "llvm/bin/clang++").exists() or not (llama / "ggml/CMakeLists.txt").exists():
+            warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
+            return
+        pc = {"rocm": str(root), "archs": meta["archs"],
+              "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
+        compile_engine_hip(pc, llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
@@ -817,6 +934,9 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
     first start how much that is on this GPU (serve/server.py, vision_footprint)."""
     step(7, "images (the vision encoder)")
+    if pc.get("backend") == "hip":
+        ok("HIP port: text only; vision is not enabled")
+        return None
     m = (MODELS.get(quant) or {}).get("vision")
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
@@ -887,6 +1007,22 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, data: Path, visi
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
            "port": port}
     env = parse_env(a.env)
+    if pc.get("backend") == "hip":
+        cfg["backend"] = "hip"
+        # Leave space for the Linux desktop. The engine sizes its prompt chunk from
+        # the available prompt-memory budget; forcing 256 here severely slows HIP.
+        hip_env = {"STRATA_GLM_SPLIT": "0", "STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
+        g = pc["gpus"][0]
+        # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
+        # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
+        if g.get("vram_gb", 0) >= 20:
+            hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
+        # The prompt projections' hipBLASLt solutions measured on this architecture (tools/hip). The engine
+        # refuses a table made for another hipBLASLt version and keeps plain hipBLAS.
+        tables = sorted((ROOT / "tools" / "hip").glob(f"{g.get('arch', '')}-glm-hipblaslt-*.txt"))
+        if tables:
+            hip_env["STRATA_HIPBLASLT_TUNING"] = str(tables[-1])
+        env = {**hip_env, **env}
     if env:
         cfg["env"] = env
     if a.host:
@@ -895,7 +1031,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, data: Path, visi
         cfg["api_key"] = a.api_key
     if vision:
         cfg["vision"] = vision
-    cfg_path = ROOT / f"maya-{quant.lower()}.json"
+    suffix = "-hip" if pc.get("backend") == "hip" else ""
+    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {"data_dir": str(data), "quant": quant,
                         "gguf_dir": str(Path(a.gguf_dir).expanduser().resolve()) if a.gguf_dir else None,
@@ -908,6 +1045,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, data: Path, visi
 
 def start(cfg_path: Path, a) -> int:
     cfg = read_json(cfg_path)
+    select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
     for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
@@ -950,8 +1088,23 @@ def start(cfg_path: Path, a) -> int:
 # ------------------------------------------------------------------------------------------------ the report
 # the engine log's lines that tell where the time goes: how the model was split across VRAM / RAM / the SSD, the
 # prompt path's chunks, and the per-token breakdown ("glm stat": VRAM hits, RAM fetches, disk reads, CPU lane)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: CUDA|glm split|glm stat|glm prefill: \d|ERR|error|failed|out of memory",
-                          re.I)
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: CUDA|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|failed|"
+                          r"out of memory", re.I)
+STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
+
+
+def speed_lines(text) -> list:
+    """The log lines REPORT_LINES picks.  A request that only read a prompt (one token out) has no decode to report:
+    its "glm stat" line keeps only the prompt part, not a meaningless decode speed (96,000 tokens/s, issue #8)."""
+    picked = []
+    for x in text:
+        if not REPORT_LINES.search(x) or "warming the expert tiers" in x:
+            continue
+        m = STAT_DECODE.search(x)   # no decode: under 1 ms a token, or no expert touched (one prompt token out)
+        if m and (float(m.group(1)) < 1.0 or "vram hit 0.00%" in x) and "| prompt " in x:
+            x = "glm stat (prompt only): prompt " + x.split("| prompt ", 1)[1]
+        picked.append(x.strip())
+    return picked
 
 
 def report(version: str) -> int:
@@ -1008,11 +1161,14 @@ def report(version: str) -> int:
         log = Path(cfg.get("log") or c.with_suffix(".log"))
         if log.exists():
             text = log.read_text(encoding="utf-8", errors="replace").splitlines()
-            picked = [x for x in text if REPORT_LINES.search(x) and "warming the expert tiers" not in x]
+            picked = speed_lines(text)
             add(f"Engine log {log.name}: the speed and memory lines (last 80 of {len(picked)})", "\n".join(picked[-80:]))
             add(f"Engine log {log.name}: the last 25 lines", "\n".join(text[-25:]))
         else:
             add(f"Engine log {log.name}", "not written yet (start Maya once and ask it something)")
+    bench_txt = ROOT / "maya-bench.txt"
+    if bench_txt.exists():
+        add("Benchmark (maya-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
     out = ROOT / "maya-report.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
@@ -1023,9 +1179,119 @@ def report(version: str) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------------------------ the benchmark
+# the same three questions on every machine (greedy, thinking off), after one warm-up answer, so speeds compare
+BENCH_TOPICS = [
+    "Write a Python function that parses a CSV file into a list of dictionaries, with type hints and a docstring.",
+    "Explain how photosynthesis works, step by step, for a high-school student.",
+    "Write a complete HTML page with a canvas that draws a bouncing ball animation in JavaScript.",
+]
+
+
+def bench(cfg_path: Path, version: str) -> int:
+    """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
+    questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
+    way the dashboard starts it.  Writes maya-bench.txt (--report includes it).  A few minutes."""
+    import urllib.request
+    cfg = read_json(cfg_path)
+    port = cfg.get("port") or 8080
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+        fail(f"Maya is running (port {port}): the benchmark needs the GPU memory it holds",
+             "stop it (Ctrl+C in its window), then run --bench again")
+    except OSError:
+        pass
+    sys.path.insert(0, str(ROOT))
+    import serve.server as SV                      # the server's own engine command and environment
+    import strata_tokenizer as ST
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+    tp = Path(cfg.get("tokenizer") or (pack / "tokenizer" if pack else ""))
+    if not (tp / "vocab.json").exists():
+        fail(f"{cfg_path.name}: the tokenizer is missing ({tp})", f"run {ME} --setup to repair it")
+    vocab = json.loads((tp / "vocab.json").read_text(encoding="utf-8"))
+    names = [None] * len(vocab)
+    for t, i in vocab.items():
+        names[i] = t
+    tok = ST.Tokenizer(names, (tp / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                       json.loads((tp / "token_type.json").read_text()))
+    ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
+    text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
+                       for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
+                       sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
+    doc = tok.encode(text)
+    lens = [n for n in (2048, 8192) if n + 64 <= ctx and n <= len(doc)]
+    log_path = ROOT / "maya-bench.log"
+    step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
+    t0 = time.time()
+    with open(log_path, "w", encoding="utf-8") as log:
+        p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
+                             cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
+
+        def gen(ids, n_new):
+            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+            p.stdin.flush()
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    fail("the engine stopped during the benchmark", f"its log: {log_path}")
+                if line.startswith("DONE") or line.startswith("ERR"):
+                    return line.split()
+
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                fail("the engine stopped while loading", f"its log: {log_path}")
+            if line.startswith("READY"):
+                break
+        ok(f"loaded in {time.time() - t0:.0f} s")
+        chat = lambda q: tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
+        gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
+        results = []
+        for q in BENCH_TOPICS:
+            f = gen(chat(q), 256)
+            if f[0] == "DONE" and float(f[4]) > 0:
+                results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0))
+                say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]}")
+        if lens:                                            # warm-up: the first prompt after a start is slower
+            gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
+        for i, n in enumerate(lens):
+            f = gen(doc[i * 997:i * 997 + n], 1)            # different openings: nothing reused between them
+            if f[0] == "DONE" and float(f[3]) > 0:
+                results.append(("prefill", f"{n} tokens", n / float(f[3]) * 1000.0))
+                say(f"  prefill {results[-1][2]:6.0f} tokens/s   a {n}-token prompt")
+        p.stdin.write("QUIT\n")
+        p.stdin.flush()
+        try:
+            p.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    stats = speed_lines(log_path.read_text(encoding="utf-8", errors="replace").splitlines())
+    dec = [r[2] for r in results if r[0] == "decode"]
+    gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in S.gpus()) or "?"
+    total, _ = mem_gb()
+    lines = [f"Project Maya v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
+             f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
+             f"setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}",
+             f"decode (writing the answer): mean {sum(dec) / max(1, len(dec)):.1f} tokens/s over {len(dec)} answers of "
+             f"256 tokens (greedy, thinking off)"]
+    lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]
+    lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
+    lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
+    out = ROOT / "maya-bench.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    say()
+    for x in lines[:4 + len(results)]:
+        say("  " + x)
+    ok(f"written: {out} - attach it (with {ME} --report) to a speed report")
+    return 0
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201 on Linux)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
@@ -1040,7 +1306,7 @@ def main() -> int:
                                        "(it must be writable - the pack is written inside it)")
     ap.add_argument("--data-dir", help="where a downloaded model goes (default: Maya-data next to this folder); use a "
                                        "fast NVMe SSD with ~100 GB free")
-    ap.add_argument("--gpu", type=int, help="run on this one GPU (as nvidia-smi numbers them)")
+    ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order)")
     ap.add_argument("--gpus", help="split the model across these two GPUs, e.g. 0,1")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
@@ -1058,14 +1324,26 @@ def main() -> int:
     ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
                                                           "speed (nothing is sent anywhere)")
+    ap.add_argument("--bench", action="store_true", help="a standard speed test of the installed model (a few "
+                                                         "minutes, with Maya stopped): decode on three questions and "
+                                                         "prefill at 2k / 8k tokens; writes maya-bench.txt")
     a = ap.parse_args()
     version = (HERE / "VERSION").read_text(encoding="utf-8").strip() if (HERE / "VERSION").exists() else "?"
-    say(f"Project Maya v{version} - GLM-5.3-Flash on your own NVIDIA GPU(s). Built on Strata (MIT) and ggml/llama.cpp "
+    say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s). Built on Strata (MIT) and ggml/llama.cpp "
         "(MIT).")
     if a.report:
         return report(version)
+    if a.bench:
+        have = configs()
+        if not have:
+            fail("Maya is not set up here yet", f"run {ME} first")
+        return bench(have[0], version)
 
     have = configs()
+    if a.backend:
+        have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
+    else:
+        a.backend = "hip" if have and read_json(have[0]).get("backend") == "hip" else "cuda"
     setting_up = a.setup or a.check or a.no_start or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model
     if have and not setting_up:
         pick = have[0]
@@ -1077,14 +1355,18 @@ def main() -> int:
         return start(pick, a)
     prev = read_json(have[0]) if have else {}
     inst = prev.get("installer") or {}
-    a.gguf_dir = a.gguf_dir or inst.get("gguf_dir")
+    if not a.model:                                    # --model asks for that download, not the files set up before
+        a.gguf_dir = a.gguf_dir or inst.get("gguf_dir")
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
 
     pc = check_pc(a)                                   # 1
     if a.check:
         say()
-        say(f"This PC can run Maya. Run {ME} without --check to set it up.")
+        if a.backend == "hip":
+            say(f"HIP prerequisites found. Run {ME} --backend hip --gpu {pc['gpus'][0]['index']} to try the experimental port.")
+        else:
+            say(f"This PC can run Maya. Run {ME} without --check to set it up.")
         return 0
     step(2, "your choices")                            # 2
     ctx = choose_context(a, prev_ctx)
