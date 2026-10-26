@@ -2182,6 +2182,10 @@ class Service:
                  "cpu": "Experts a token computed on the CPU lane (DeepSeek)",
                  "disk_mb": "MB a token the storage read (DeepSeek, Linux)",
                  "engram_ms": "The n-gram memory's (Engram) read time a token, ms (DeepSeek)",
+                 "slot_ram": "Parked DeepSeek conversations held in RAM",
+                 "slot_disk": "Parked DeepSeek conversations held in the slot folder",
+                 "slot_ram_bytes": "Parked DeepSeek conversation payload bytes in RAM",
+                 "slot_ram_cap": "Parked DeepSeek conversation RAM budget, bytes; 0 means count-limited only",
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
                  "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
 
