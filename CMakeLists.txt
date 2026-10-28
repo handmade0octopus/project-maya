@@ -1374,6 +1374,12 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
   endif()
 
+  if(WIN32)
+    add_executable(ds4_copy_cache_windows_test tests/ds4_copy_cache_windows_test.cpp)
+    target_include_directories(ds4_copy_cache_windows_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME ds4_copy_cache_windows_test COMMAND ds4_copy_cache_windows_test)
+  endif()
+
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
     target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
