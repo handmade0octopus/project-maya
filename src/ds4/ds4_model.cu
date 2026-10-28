@@ -9292,6 +9292,17 @@ struct Model::Impl {
         }
     }
 
+    // (pr/rc-fill-error, test-only) DS4_FAULT_RC_FILL=N: every Nth recent-slot fill fails at issue (as if its first
+    // H2D enqueue failed - nothing copied) while the completion event still records, so the fill error path can be
+    // exercised on demand.  0/absent: off.
+    static int rc_fill_fault_rate() {
+        static const int rate = [] {
+            const char* v = std::getenv("DS4_FAULT_RC_FILL");
+            return v && *v ? (int) std::strtol(v, nullptr, 10) : 0;
+        }();
+        return rate;
+    }
+
     void rc_loop() {
         std::vector<RcJob> fly;     // issued, not yet done
         std::deque<RcJob> held;     // waiting for their group's turn to end (copy_open)
@@ -9313,13 +9324,27 @@ struct Model::Impl {
                     ++i;
                     continue;
                 }
+                // (commit 1: the injected failure skips the copies but still records the event and pushes the job, and
+                // the return value is discarded - the pre-fix behavior this branch fixes)
+                const int fault_rate = rc_fill_fault_rate();
+                bool injected = false;
+                if (fault_rate > 0) {
+                    static std::atomic<int> seq{0};
+                    injected = seq.fetch_add(1, std::memory_order_relaxed) % fault_rate == fault_rate - 1;
+                }
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& x = member(l, m);
                     const int di = x.dev;
                     cudaSetDevice(devs[(size_t) di].id);
                     cudaStreamWaitEvent(rc_cs[(size_t) di], rc_go[(size_t) di], 0);   // (after the tick's tables)
                     copy_after_idle(di, rc_cs[(size_t) di]);
-                    stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err);
+                    if (injected)
+                        err = "DS4_FAULT_RC_FILL: injected recent-slot fill failure (nothing was copied)";
+                    else
+                        stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err);
+                    if (injected)
+                        std::fprintf(stderr, "ds4: FAULT recent-slot fill: layer %d expert %d slot %d fails at issue"
+                                             " (the tick will still publish it)\n", l.il, j.expert, l.rc_base + j.slot);
                     cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
                 }
                 fly.push_back(j);
