@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """serve/fake_dspark_engine.py - a stand-in for `maya-ds4 --serve` that reports drafts by source, for
 serve/test_dspark_dp.py: every request answers a few tokens, then its DP split and DONE.
 

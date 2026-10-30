@@ -1,4 +1,4 @@
-﻿"""serve/test_dspark_dp.py - the drafts' split by source (issue #590): the engine's DP line before each DONE reaches
+"""serve/test_dspark_dp.py - the drafts' split by source (issue #590): the engine's DP line before each DONE reaches
 engine.last, the /metrics rows and totals, and Prometheus - with the DSpark drafter's and the prompt lookup's drafts
 told apart, and an engine without DP still reporting the DONE's sum alone.
 
