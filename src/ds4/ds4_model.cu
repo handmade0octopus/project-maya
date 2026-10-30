@@ -1260,8 +1260,9 @@ struct Model::Impl {
     bool sample_drafts = std::getenv("DS4_DSPARK_SAMPLE") != nullptr && std::atoi(std::getenv("DS4_DSPARK_SAMPLE")) != 0;
     float q_temp_scale = std::getenv("DS4_DSPARK_QTEMP") ? (float) std::atof(std::getenv("DS4_DSPARK_QTEMP")) : 1.0f;
     int max_drafts = std::getenv("DS4_DSPARK_MAX") ? std::atoi(std::getenv("DS4_DSPARK_MAX")) : 0;
-    // DS4_DSPARK_LAZY=0: the whole drafter head and every confidence, as before. Default: only rows the round can keep.
-    bool draft_lazy = !(std::getenv("DS4_DSPARK_LAZY") != nullptr && std::atoi(std::getenv("DS4_DSPARK_LAZY")) == 0);
+    // DS4_DSPARK_LAZY=1: only rows the round can keep. Off by default on this branch: on the RTX 4090 D's 8-row
+    // GGUF head the extra stages measured 2.34x the eager drafter cost over 200 same-state rounds.
+    bool draft_lazy = std::getenv("DS4_DSPARK_LAZY") != nullptr && std::atoi(std::getenv("DS4_DSPARK_LAZY")) != 0;
     std::FILE* dump_d = std::getenv("DS4_DSPARK_DUMP") ? std::fopen(std::getenv("DS4_DSPARK_DUMP"), "wb") : nullptr;
     float* h_dump = nullptr;          // (the dump's pinned copies: each block's stream, each block's ring)
     uint16_t* h_dump_ring = nullptr;
@@ -15076,7 +15077,51 @@ struct Model::Impl {
         dq_min_p = min_p;
         dq_seed = seed;
         dq_counter = counter;
-        const bool ok = draft_(y, out, conf, err, max_n, conf_min, cum_min, min_n);
+        bool ok = true;
+        // Test-only DS4_DSPARK_LAZY_CHECK=1: eager and lazy from the SAME model state, so transport and sampler
+        // nondeterminism cannot masquerade as a lazy-head mismatch. The lazy prefix must be bit-identical and contain
+        // every draft the caller's fixed cut keeps.
+        static const bool lazy_check_env = std::getenv("DS4_DSPARK_LAZY_CHECK") != nullptr;
+        const bool lazy_check = lazy_check_env && draft_lazy && (max_n > 0 || conf_min > 0.0f || cum_min > 0.0f);
+        if (lazy_check) {
+            std::vector<int> eager;
+            std::vector<float> ec;
+            const double te0 = now_ms();
+            draft_lazy = false;
+            ok = draft_(y, eager, ec, err, max_n, conf_min, cum_min, min_n);
+            const double te1 = now_ms();
+            draft_lazy = true;
+            if (ok) ok = draft_(y, out, conf, err, max_n, conf_min, cum_min, min_n);
+            const double te2 = now_ms();
+            if (ok) {
+                static double eager_ms = 0.0, lazy_ms = 0.0;
+                static long checked = 0;
+                eager_ms += te1 - te0;
+                lazy_ms += te2 - te1;
+                if (++checked % 100 == 0)
+                    std::fprintf(stderr, "ds4: lazy check %ld rounds: eager %.1f ms, lazy %.1f ms (%.1f%%)\n",
+                                 checked, eager_ms, lazy_ms, 100.0 * lazy_ms / std::max(0.001, eager_ms));
+            }
+            if (ok) {
+                int lim = (int) eager.size();
+                if (max_drafts > 0) lim = std::min(lim, max_drafts);
+                if (max_n > 0) lim = std::min(lim, max_n);
+                int keep = 0;
+                float cum = 1.0f;
+                while (keep < lim && ec[(size_t) keep] >= conf_min && (cum *= ec[(size_t) keep]) >= cum_min) ++keep;
+                bool same = out.size() >= (size_t) keep && out.size() <= (size_t) lim && conf.size() == out.size();
+                for (size_t i = 0; same && i < out.size(); ++i)
+                    same = out[i] == eager[i] && conf[i] == ec[i];
+                if (!same) {
+                    std::fprintf(stderr,
+                                 "ds4: DS4_DSPARK_LAZY_CHECK mismatch at %lld: eager %d rows / cut %d, lazy %zu rows\n",
+                                 (long long) pos, lim, keep, out.size());
+                    ok = false;
+                }
+            }
+        } else {
+            ok = draft_(y, out, conf, err, max_n, conf_min, cum_min, min_n);
+        }
         if (!ok) drafts_q = false;
         if (max_drafts > 0 && (int) out.size() > max_drafts) {
             out.resize((size_t) max_drafts);
