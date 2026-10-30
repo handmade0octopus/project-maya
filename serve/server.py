@@ -2693,7 +2693,7 @@ class Service:
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "tok_s": round(self._tok_s(), 1) if s.get("busy") else None,   # (summed over the requests decoding now, also while others still read: parallel)
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
@@ -3329,6 +3329,9 @@ class Service:
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         responses = (sampling or {}).get("_responses") is True
+        # Local one-shot benchmarks keep exact prompt ids and forced length, but still use this Service's normal
+        # FIFO, status, history and /metrics. The separate endpoint and this path both require the explicit opt-ins.
+        raw_benchmark = os.environ.get("STRATA_BENCH_RAW") == "1" and (sampling or {}).get("_bench_raw") is True
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                               dsml=getattr(self.template, "deepseek", False),
@@ -3466,7 +3469,7 @@ class Service:
                                   "running the request again from token 0", flush=True)
                         finally:
                             sliced.close()
-                guard_on = self._loop_guard_on(sampling)
+                guard_on = False if raw_benchmark else self._loop_guard_on(sampling)
                 gen = attempts()
                 said = bool(pre_events)                 # any answer (text or a call) went out yet
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
@@ -3498,6 +3501,15 @@ class Service:
                                 print(f"[maya] thinking reached its budget ({think_budget} tokens"
                                       f"{f', {soft} + {think_budget - soft} without a sentence end' if soft else ''})"
                                       ": closed, answering", flush=True)
+                        if raw_benchmark:
+                            raw_ids.append(t)
+                            if n == 1:
+                                with self.status_lock:
+                                    self.status["phase"] = "answering"
+                            self._note(n, [], stat)
+                            last_print = self._progress(last_print)
+                            yield "token", t
+                            continue
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
@@ -4151,6 +4163,17 @@ def anthropic_collect(events) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
+def raw_benchmark_chunks(svc: Service, req: dict, ids: list[int], max_new: int, cancel: threading.Event):
+    """Exact token ids through the ordinary Service run/status path; enabled only by the local benchmark endpoint."""
+    for kind, x in svc.run(ids, False, None, max_new, req, cancel):
+        if kind == "ping":
+            yield {"prompt_progress": x} if isinstance(x, dict) else None
+        elif kind == "token":
+            yield {"token": x}
+        elif kind == "done":
+            yield {"done": {**x, "prompt_tokens": len(ids)}}
+
+
 def _backlog() -> int:
     try:
         return max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
@@ -4492,7 +4515,7 @@ def make_handler(svc: Service):
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
-                self._json(200, {"status": "updating" if svc.updater.busy() else
+                self._json(200, {"service": "strata", "status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
                                  "max_text_file": text_file_limit(svc.engine.max_context),
@@ -4634,6 +4657,9 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("the request body must be a JSON object")
+                if path == "/v1/bench/generate":
+                    self._raw_benchmark(req)
+                    return
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
                     return
@@ -4788,6 +4814,35 @@ def make_handler(svc: Service):
             print("[maya] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
                   if shared else "[maya] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
+
+        def _raw_benchmark(self, req):
+            if os.environ.get("STRATA_BENCH_RAW") != "1":
+                return self._json(404, {"error": {"message": "not found"}})
+            ids = req.get("ids")
+            if not isinstance(ids, list) or not ids or any(type(t) is not int or t < 0 for t in ids):
+                raise ValueError("ids must be a nonempty array of nonnegative integers")
+            max_new = req.get("max_tokens")
+            if type(max_new) is not int or max_new <= 0:
+                raise ValueError("max_tokens must be a positive integer")
+            if len(ids) + max_new + CTX_SLACK > svc.engine.max_context:
+                raise ValueError("prompt + max_tokens exceeds the context")
+            sampling = {k: v for k, v in req.items() if k != "ids"}
+            sampling.update(_bench_raw=True, _api="openai", loop_guard=False)
+            cancel = threading.Event()
+            watch_client(self, cancel)
+            chunks = raw_benchmark_chunks(svc, sampling, ids, max_new, cancel)
+            self._sse()
+            try:
+                for c in chunks:
+                    if c is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                cancel.set()
+            finally:
+                cancel.set()
 
         def _sse(self):
             self.send_response(200)
