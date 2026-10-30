@@ -1260,6 +1260,8 @@ struct Model::Impl {
     bool sample_drafts = std::getenv("DS4_DSPARK_SAMPLE") != nullptr && std::atoi(std::getenv("DS4_DSPARK_SAMPLE")) != 0;
     float q_temp_scale = std::getenv("DS4_DSPARK_QTEMP") ? (float) std::atof(std::getenv("DS4_DSPARK_QTEMP")) : 1.0f;
     int max_drafts = std::getenv("DS4_DSPARK_MAX") ? std::atoi(std::getenv("DS4_DSPARK_MAX")) : 0;
+    // DS4_DSPARK_LAZY=0: the whole drafter head and every confidence, as before. Default: only rows the round can keep.
+    bool draft_lazy = !(std::getenv("DS4_DSPARK_LAZY") != nullptr && std::atoi(std::getenv("DS4_DSPARK_LAZY")) == 0);
     std::FILE* dump_d = std::getenv("DS4_DSPARK_DUMP") ? std::fopen(std::getenv("DS4_DSPARK_DUMP"), "wb") : nullptr;
     float* h_dump = nullptr;          // (the dump's pinned copies: each block's stream, each block's ring)
     uint16_t* h_dump_ring = nullptr;
@@ -15063,7 +15065,8 @@ struct Model::Impl {
     }
 
     bool draft(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err, float temperature, float top_p,
-               int top_k, float min_p, uint64_t seed, uint64_t counter) {
+               int top_k, float min_p, uint64_t seed, uint64_t counter, int max_n, float conf_min, float cum_min,
+               int min_n) {
         const double t0 = now_ms();
         // (with penalties the drafts are the drafter's argmax: its own draws know no history - verify() is as exact)
         drafts_q = temperature > 0.0f && sample_drafts && pen_n <= 0;
@@ -15073,7 +15076,7 @@ struct Model::Impl {
         dq_min_p = min_p;
         dq_seed = seed;
         dq_counter = counter;
-        const bool ok = draft_(y, out, conf, err);
+        const bool ok = draft_(y, out, conf, err, max_n, conf_min, cum_min, min_n);
         if (!ok) drafts_q = false;
         if (max_drafts > 0 && (int) out.size() > max_drafts) {
             out.resize((size_t) max_drafts);
@@ -15083,7 +15086,10 @@ struct Model::Impl {
         ++st.drafts_rounds;
         return ok;
     }
-    bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
+    // max_n, conf_min, cum_min: round()'s cut; the lazy head stops there, but not before min_n rows. Parallel
+    // draft_multi() stays eager so its shared cost planner still sees every candidate.
+    bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err, int max_n = 0,
+                float conf_min = 0.0f, float cum_min = 0.0f, int min_n = 0) {
         out.clear();
         conf.clear();
         const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
@@ -15209,6 +15215,10 @@ struct Model::Impl {
         // the drafter's final norm and the trunk's head, on every member of the head group (the others' shares first)
         const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
         const bool mk = mk_split && !drafts_q;   // (sampled drafts: the lead's whole rows, gathered)
+        // A lone head's rows are independent: confidence t reads x[t] and draft t-1 only. Grouped heads and dumps
+        // keep the eager path; the latter must contain the whole block.
+        const bool has_cut = max_n > 0 || conf_min > 0.0f || cum_min > 0.0f;
+        const bool lazy = draft_lazy && has_cut && hg.size() == 1 && dump_d == nullptr;
         for (int m = (int) hg.size() - 1; m >= 0; --m) {
             Dev& e = devs[(size_t) hg[(size_t) m]];
             cudaSetDevice(e.id);
@@ -15222,10 +15232,64 @@ struct Model::Impl {
             fn.w = e.d_norm;
             fn.eps = g.eps;
             finish(e.ao, T, D, D, fn, e.st);
-            if (!head_share(e, m, e.ao, T, err, !mk)) return false;
+            if (!lazy && !head_share(e, m, e.ao, T, err, !mk)) return false;
         }
         h_idx[0] = y;
-        if (mk) {
+        strata::kernels::SamplerParams sp;
+        sp.greedy = true;
+        sp.temperature = 0.0f;
+        if (drafts_q) {   // the request's own chain: draft i drawn as the model's token i would be (verify's counter + i)
+            sp.greedy = false;
+            sp.temperature = dq_temp * (q_temp_scale > 0.0f ? q_temp_scale : 1.0f);
+            sp.top_p = dq_top_p;
+            sp.top_k = dq_top_k;
+            sp.min_p = dq_min_p;
+            sp.seed = dq_seed;
+        }
+        const auto picks = [&](int a, int b) {   // the markov bias of the token before, then that position's draft
+            for (int i = a; i < b; ++i) {
+                float* row = hd.logits + (size_t) i * V;
+                if (markov_q8) markov_add_q8(row, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
+                else markov_add(row, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
+                if (drafts_q) {
+                    sp.counter = dq_counter + (uint64_t) i;   // (absolute row, also in a later lazy stage)
+                    strata::kernels::sample_draft(row, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
+                } else
+                    strata::kernels::sample_tokens(row, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
+            }
+        };
+        int made = T;   // the drafts made (head rows 0 .. made - 1)
+        if (lazy) {
+            // Confidence 0 needs no head row. Then make rows 0-1, and finally only the rows still capable of
+            // surviving round()'s cut. The host cut repeats its float operations in the same order.
+            int lim = T;
+            if (max_drafts > 0) lim = std::min(lim, max_drafts);
+            if (max_n > 0) lim = std::min(lim, max_n);
+            CK(cudaMemcpyAsync(d_ints, h_idx, 4, cudaMemcpyHostToDevice, hd.st));
+            int nc = 0, keep = 0;   // confidences made; drafts the cut keeps so far
+            float cum = 1.0f;
+            made = 0;
+            for (int b : {0, 2, lim}) {
+                b = std::min(b, lim);
+                if (b > made) {
+                    if (!head_share(hd, 0, hd.ao, b - made, err, false, made)) return false;
+                    picks(made, b);
+                    made = b;
+                }
+                const int c1 = std::min(b + 1, lim);   // (confidence b predicts draft b from draft b-1)
+                if (c1 > nc)
+                    confidence(hd.x + (size_t) nc * D, d_mk_embed, d_ints + nc, d_conf, c1 - nc, D, R, d_confv + nc,
+                               hd.st);
+                CK(cudaMemcpyAsync(h_idx, d_ints, (size_t) (T + 1) * 4, cudaMemcpyDeviceToHost, hd.st));
+                CK(cudaMemcpyAsync(h_w, d_confv, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
+                CK(cudaStreamSynchronize(hd.st));
+                const bool open = keep == nc;   // (a stage forced by min_n past a cut must not resume it)
+                nc = c1;
+                if (open)
+                    while (keep < nc && h_w[keep] >= conf_min && (cum *= h_w[keep]) >= cum_min) ++keep;
+                if ((keep < nc && made >= min_n) || made >= lim) break;
+            }
+        } else if (mk) {
             // the markov steps over the group: each member its rows of the bias and its share's argmax, every member
             // then the global one (the sampler's tie rule) and its E row - the same drafts as the lead's whole rows,
             // each step ~1/nm of their 66 MB and no gather of the shares
@@ -15251,34 +15315,16 @@ struct Model::Impl {
             cudaSetDevice(hd.id);
         } else {
             CK(cudaMemcpyAsync(d_ints, h_idx, 4, cudaMemcpyHostToDevice, hd.st));
-            strata::kernels::SamplerParams sp;
-            sp.greedy = true;
-            sp.temperature = 0.0f;
-            if (drafts_q) {   // the request's own chain: draft i drawn as the model's token i would be (verify's counter + i)
-                sp.greedy = false;
-                sp.temperature = dq_temp * (q_temp_scale > 0.0f ? q_temp_scale : 1.0f);
-                sp.top_p = dq_top_p;
-                sp.top_k = dq_top_k;
-                sp.min_p = dq_min_p;
-                sp.seed = dq_seed;
-            }
-            for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
-                float* row = hd.logits + (size_t) i * V;
-                if (markov_q8) markov_add_q8(row, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
-                else markov_add(row, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
-                if (drafts_q) {
-                    sp.counter = dq_counter + (uint64_t) i;
-                    strata::kernels::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
-                } else
-                    strata::kernels::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
-            }
+            picks(0, T);
         }
-        confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
-        int tok[kWin + 1];
-        float cf[kWin];
-        CK(cudaMemcpyAsync(h_idx, d_ints, (size_t) (T + 1) * 4, cudaMemcpyDeviceToHost, hd.st));
-        CK(cudaMemcpyAsync(h_w, d_confv, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
-        CK(cudaStreamSynchronize(hd.st));
+        if (!lazy) {
+            confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
+            CK(cudaMemcpyAsync(h_idx, d_ints, (size_t) (T + 1) * 4, cudaMemcpyDeviceToHost, hd.st));
+            CK(cudaMemcpyAsync(h_w, d_confv, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
+            CK(cudaStreamSynchronize(hd.st));
+        }
+        int tok[kWin + 1] = {};
+        float cf[kWin] = {};
         for (int i = 0; i <= T; ++i) tok[i] = h_idx[i];
         for (int i = 0; i < T; ++i) cf[i] = h_w[i];
         if (dump_d != nullptr) {   // 'D', the block's position, y, T, then the drafts, their confidences, the hidden
@@ -15301,7 +15347,7 @@ struct Model::Impl {
             std::fflush(dump_d);
             cudaSetDevice(hd.id);
         }
-        for (int i = 0; i < T; ++i) {
+        for (int i = 0; i < made; ++i) {
             out.push_back(tok[i + 1]);
             conf.push_back(cf[i]);
         }
@@ -18284,8 +18330,9 @@ struct Model::Impl {
     // the head over `rows` (<= 16) normed rows xn on member mi of the head group (device d): its share of each row's
     // logits (columns [v0, v0 + vn), head_cols); the lead gathers the others' into d.logits (rows V apart) - two
     // slots by seq (Vmax apart, the widest share's), a member reusing one once the lead acknowledged it.  gather
-    // false: each member keeps its share (the drafter's markov steps over the group, mk_split)
-    bool head_share(Dev& d, int mi, const float* xn, int rows, std::string& err, bool gather = true) {
+    // false: each member keeps its share (the drafter's markov steps over the group, mk_split). r0 offsets the input
+    // and output rows for the lone head's lazy stages; grouped gathers always use r0=0.
+    bool head_share(Dev& d, int mi, const float* xn, int rows, std::string& err, bool gather = true, int r0 = 0) {
         const int V = g.vocab, D = g.dim, nm = head_nm();
         int v0 = 0, vn = 0, Vmax = 0, z = 0;
         head_cols(nm, mi, v0, vn);
@@ -18299,8 +18346,9 @@ struct Model::Impl {
         // share of the vocabulary's rows, so up to 8 rows (the drafter's block) take one pass instead of two and 16
         // two instead of four; a column's logits are the same at any count: gguf mv sums each activation on its own)
         const int per = d.head.fmt != 0 ? head_cols_gguf : std::max(1, x3::mv_cols(d.head));
-        for (int c = 0; c < rows; c += per)
-            if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))
+        for (int c = r0; c < r0 + rows; c += per)
+            if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld,
+                            std::min(per, r0 + rows - c), D, ld)}, err))
                 return false;
         if (nm == 1 || !gather) return true;
         const unsigned seq = ++d.head_seq;
@@ -20166,8 +20214,8 @@ void Model::set_images(std::vector<Image> images) {
 }
 int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
-                  float mp, uint64_t seed, uint64_t counter) {
-    return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter);
+                  float mp, uint64_t seed, uint64_t counter, int max_n, float conf_min, float cum_min, int min_n) {
+    return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter, max_n, conf_min, cum_min, min_n);
 }
 bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
                    int& accepted, int& next, std::string& err) {

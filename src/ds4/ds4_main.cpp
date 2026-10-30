@@ -382,11 +382,18 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     if (drafter) {
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        const bool cost_window = dc != nullptr && cum_min < 0;
+        // DraftCost considers every draft above the individual floor; the fixed cut uses its normal cumulative default.
+        const float draft_cum = cost_window ? 0.0f : (cum_min < 0 ? dspark_cum_default() : cum_min);
+        // Propose lookup first: even a cut first DSpark draft must exist for the comparison (min_n=1 with a proposal).
+        const int k = lk != nullptr ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, room - 1, conf_min,
+                     draft_cum, k > 0 ? 1 : 0))
+            return false;
         const int made = (int) drafts.size();
         int keep = 0;
         if (dc != nullptr) dc->alone.set_context(m.pos());
-        if (dc != nullptr && cum_min < 0) {   // (the drafts under the floor; of those, the window that pays best)
+        if (cost_window) {   // (the drafts under the floor; of those, the window that pays best)
             int n = 0;
             while (n < (int) drafts.size() && n < room - 1 && n < strata::spec::DraftPolicy::kMaxT - 1 &&
                    conf[(size_t) n] >= conf_min)
@@ -403,7 +410,6 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         }
         bool from_lk = false;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
-            const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
             match = lk->sfx.last_match();
             if (k > 0 && lk->buf[0] == drafts[0]) {
                 const strata::spec::DraftPolicy::Pick pk = lk->policy.choose(keep + 1, k, match);
@@ -1893,16 +1899,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<std::unique_ptr<Act>> acts;
         std::deque<std::string> waiting;   // GEN lines no conversation is free for yet
         std::deque<Act*> read_line;        // the prompts being read, in turn: a piece each, then to the back
-        const bool read_pieces = [] {
-            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+        // serve's maya_names.env_in keeps the STRATA_ alias of a config's MAYA_ setting. Accept that alias here too;
+        // reading MAYA_ alone silently restored piece reads for a config that asked for arrival order.
+        const auto read_env = [](const char* name) {
+            if (const char* v = std::getenv(name)) return v;
+            return ds4_env(name + 5);   // (these names all start MAYA_; ds4_env tries STRATA_, then the bare name)
+        };
+        const bool read_pieces = [&] {
+            const char* v = read_env("MAYA_DS4_READ_ORDER");
             return v == nullptr || std::string(v) != "arrival";
         }();
         // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
         // running answers write n tokens each (n rounds) between two pieces (1); MAYA_DS4_READ_SHARE=<percent>: instead,
         // they write for that share of the time, their rounds' against the last piece's (a round at least; 0: off)
         constexpr int kReadPieceChunks = 1, kReadRounds = 1, kReadShareMax = 90;
-        const auto env_count = [](const char* name, int dflt) {
-            const char* v = std::getenv(name);
+        const auto env_count = [&](const char* name, int dflt) {
+            const char* v = read_env(name);
             const int x = v != nullptr ? std::atoi(v) : 0;
             return x > 0 ? x : dflt;
         };
